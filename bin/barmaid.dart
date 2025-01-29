@@ -3,7 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive.dart';
+import 'package:barmaid/auth.dart';
+import 'package:barmaid/types.dart';
 import 'package:crypto/crypto.dart';
+import 'package:endec_json/endec_json.dart';
+import 'package:logging/logging.dart';
 import 'package:path/path.dart';
 import 'package:pubspec_parse/pubspec_parse.dart';
 import 'package:shelf/shelf.dart';
@@ -13,7 +17,6 @@ import 'package:shelf_router/shelf_router.dart';
 import 'package:uuid/uuid.dart';
 import 'package:yaml/yaml.dart';
 
-final authPattern = RegExp('Bearer (.*)');
 const fileDispositionHeader = 'form-data; name="file"; filename="package.tar.gz"';
 const pubContentType = {
   HttpHeaders.contentTypeHeader: 'application/vnd.pub.v2+json',
@@ -38,12 +41,16 @@ Map<String, dynamic> analyzeUpload(List<int> fileBytes) {
     throw AnalysisException('missing_pubspec', 'no pubspec in uploaded package');
   }
 
-  return (loadYaml(utf8.decode(pubspecFile.readBytes()!)) as YamlMap).cast();
+  return jsonDecode(jsonEncode((loadYaml(utf8.decode(pubspecFile.readBytes()!)) as YamlMap).cast<String, dynamic>()));
 }
 
-final packageIndexCache = <String, List<Map<String, dynamic>>>{};
+// ---
 
-Future<List<Map<String, dynamic>>?> loadPackageIndex(String package, {bool allowEmpty = false}) async {
+final packageIndexCache = <String, List<PackageIndexEntry>>{};
+final packageIndexEndec = PackageIndexEntry.endec.listOf();
+const jsonEncoder = JsonEncoder.withIndent('  ');
+
+Future<List<PackageIndexEntry>?> loadPackageIndex(String package, {bool allowEmpty = false}) async {
   if (packageIndexCache.containsKey(package)) {
     return packageIndexCache[package];
   }
@@ -55,24 +62,31 @@ Future<List<Map<String, dynamic>>?> loadPackageIndex(String package, {bool allow
     return null;
   }
 
-  return indexExists ? (jsonDecode(await packageIndexFile.readAsString()) as List<dynamic>).cast() : [];
+  return indexExists ? fromJson(packageIndexEndec, jsonDecode(await packageIndexFile.readAsString())) : [];
 }
 
-Future<void> savePackageIndex(String package, List<Map<String, dynamic>> index) async {
+Future<void> savePackageIndex(String package, List<PackageIndexEntry> index) async {
   final packageIndexFile = File(join(repoDir, package, 'index.json'));
   await packageIndexFile.create(recursive: true);
-  await packageIndexFile.writeAsString(const JsonEncoder.withIndent('  ').convert(index));
+  await packageIndexFile.writeAsString(jsonEncoder.convert(toJson(packageIndexEndec, index)));
 
   packageIndexCache[package] = index;
 }
 
-Future<void> main(List<String> args) async {
-  final app = Router();
-  final baseUrl = args.first;
+// ---
 
-  final tokens = (jsonDecode(await File('tokens.json').readAsString()) as Map<String, dynamic>).map(
-    (key, value) => MapEntry(key, Set<String>.from(value['authorized_packages'])),
-  );
+Future<void> main(List<String> args) async {
+  final logger = Logger('barmaid');
+  Logger.root.level = Level.INFO;
+  Logger.root.onRecord.listen((record) {
+    print('${record.level.name}: ${record.time}: ${record.message}');
+  });
+
+  final [baseUrl, portString, ...] = args;
+  final port = int.parse(portString);
+
+  final tokens = TokenStore.read('tokens.json');
+  logger.info('loaded ${tokens.tokens.length} tokens');
 
   await Directory(repoDir).create();
 
@@ -89,46 +103,11 @@ Future<void> main(List<String> args) async {
         }),
       );
 
-  String? getToken(Request request) {
-    final authHeader = request.headers[HttpHeaders.authorizationHeader];
-    if (authHeader == null) return null;
-
-    return authPattern.firstMatch(authHeader)?[1];
-  }
-
-  Response? checkAuth(Request request, [String? package]) {
-    final token = getToken(request);
-    if (token == null) {
-      return Response.unauthorized(
-        null,
-        headers: {HttpHeaders.wwwAuthenticateHeader: 'Bearer realm="pub", message="no token provided"'},
-      );
-    }
-
-    if (!tokens.containsKey(token)) {
-      return Response.unauthorized(
-        null,
-        headers: {HttpHeaders.wwwAuthenticateHeader: 'Bearer realm="pub", message="invalid token"'},
-      );
-    }
-
-    if (package == null) {
-      return null;
-    }
-
-    final packagesForToken = tokens[token]!;
-    if (packagesForToken.contains('*') || packagesForToken.contains(package)) return null;
-
-    return Response.forbidden(
-      null,
-      headers: {
-        HttpHeaders.wwwAuthenticateHeader: 'Bearer realm="pub", message="insufficient authorization for package"'
-      },
-    );
-  }
+  final app = Router();
 
   app.get('/api/packages/versions/new', (Request request) {
-    if (checkAuth(request) case var response?) {
+    if (tokens.checkAuth(request) case var response?) {
+      logger.warning('${request.origin} failed auth check');
       return response;
     }
 
@@ -154,9 +133,13 @@ Future<void> main(List<String> args) async {
     }
 
     final packageName = archivePubspec['name'];
-    if (checkAuth(request, packageName) case var response?) {
+    if (tokens.checkAuth(request, packageName) case var response?) {
+      logger.warning('${request.origin} failed package permission check');
       return response;
     }
+
+    final tokenProps = tokens.getTokenProps(request);
+    logger.info('(${tokenProps.owner}) new archive uploaded');
 
     final uploadUuid = const Uuid().v4();
     uploadCache[uploadUuid] = (
@@ -173,7 +156,8 @@ Future<void> main(List<String> args) async {
   });
 
   app.get('/api/upload/finalize/<package>/<upload-uuid>', (Request request, String package, String uploadUuid) async {
-    if (checkAuth(request, package) case var response?) {
+    if (tokens.checkAuth(request, package) case var response?) {
+      logger.warning('${request.origin} failed package permission check');
       return response;
     }
 
@@ -183,21 +167,24 @@ Future<void> main(List<String> args) async {
     final packageIndex = await loadPackageIndex(parsedPubspec.name, allowEmpty: true);
     packageIndex!;
 
-    if (packageIndex.any((element) => element['pubspec']['version'] == parsedPubspec.version.toString())) {
+    if (packageIndex.any((element) => element.pubspec['version'] == parsedPubspec.version.toString())) {
       return errorResponse('duplicate_version', 'version ${parsedPubspec.version} already exists');
     }
 
     final versionUuid = const Uuid().v4();
-    packageIndex.add({
-      'uuid': versionUuid,
-      'hash': sha256.convert(archiveBytes).toString(),
-      'pubspec': pubspecJson,
-    });
+    packageIndex.add(PackageIndexEntry(
+      versionUuid,
+      sha256.convert(archiveBytes).toString(),
+      pubspecJson,
+    ));
 
     await savePackageIndex(parsedPubspec.name, packageIndex);
 
     final archiveFile = File(join(repoDir, parsedPubspec.name, '$versionUuid.tar.gz'));
     await archiveFile.writeAsBytes(archiveBytes);
+
+    final tokenProps = tokens.getTokenProps(request);
+    logger.info('(${tokenProps.owner}) finalized version ${parsedPubspec.version} of $package');
 
     return Response.ok(
       headers: pubContentType,
@@ -213,11 +200,11 @@ Future<void> main(List<String> args) async {
       return errorResponse('unknown_package', 'unknown package', statusCode: HttpStatus.notFound);
     }
 
-    Map<String, dynamic> encodeVersion(Map<String, dynamic> indexEntry) => {
-          'version': indexEntry['pubspec']['version'],
-          'archive_url': '$baseUrl/api/packages/$packageName/archive/${indexEntry['uuid']}.tar.gz',
-          'archive_sha256': indexEntry['hash'],
-          'pubspec': indexEntry['pubspec']
+    Map<String, dynamic> encodeVersion(PackageIndexEntry indexEntry) => {
+          'version': indexEntry.pubspec['version'],
+          'archive_url': '$baseUrl/api/packages/$packageName/archive/${indexEntry.uuid}.tar.gz',
+          'archive_sha256': indexEntry.hash,
+          'pubspec': indexEntry.pubspec
         };
 
     return Response.ok(
@@ -236,7 +223,7 @@ Future<void> main(List<String> args) async {
     '/api/packages/<package-name>/archive/<version-uuid>.tar.gz',
     (Request request, String packageName, String versionUuid) async {
       final packageIndex = await loadPackageIndex(packageName);
-      if (packageIndex == null || !packageIndex.any((element) => element['uuid'] == versionUuid)) {
+      if (packageIndex == null || !packageIndex.any((element) => element.uuid == versionUuid)) {
         return errorResponse('unkown_version', 'unknown version', statusCode: HttpStatus.notFound);
       }
 
@@ -254,11 +241,22 @@ Future<void> main(List<String> args) async {
     },
   );
 
-  await serve(app.call, 'localhost', 3675);
-  print('serving pub packages on localhost:3675');
+  final pipeline = const Pipeline().addMiddleware(
+    createMiddleware(requestHandler: (request) {
+      logger.info('${request.method} /${request.url} from ${request.origin}');
+      return null;
+    }),
+  ).addHandler(app.call);
+
+  await serve(pipeline, 'localhost', port);
+  logger.info('serving pub packages on localhost:$port');
 }
 
 class AnalysisException implements Exception {
   final String message, errorCode;
   AnalysisException(this.message, this.errorCode);
+}
+
+extension on Request {
+  String get origin => (this.context['shelf.io.connection_info'] as HttpConnectionInfo).remoteAddress.address;
 }
