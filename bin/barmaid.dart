@@ -258,5 +258,17 @@ class AnalysisException implements Exception {
 }
 
 extension on Request {
-  String get origin => (this.context['shelf.io.connection_info'] as HttpConnectionInfo).remoteAddress.address;
+  String get origin {
+    final client = (this.context['shelf.io.connection_info'] as HttpConnectionInfo).remoteAddress.address;
+    final origin = StringBuffer();
+
+    if (headers.containsKey(_forwardedHeader)) {
+      origin.write(headers[_forwardedHeader]!);
+      origin.write(', ');
+    }
+
+    return (origin..write(client)).toString();
+  }
+
+  static const _forwardedHeader = 'x-forwarded-for';
 }
