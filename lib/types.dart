@@ -23,6 +23,16 @@ class PackageIndexEntry {
 }
 
 @GenerateStructEndec()
+class PackageProperties {
+  static final endec = _$PackagePropertiesEndec;
+
+  final bool discontinued;
+  final String? replacedBy;
+
+  PackageProperties(this.discontinued, this.replacedBy);
+}
+
+@GenerateStructEndec()
 class TokenProperties {
   static final endec = _$TokenPropertiesEndec;
 

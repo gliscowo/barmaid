@@ -75,6 +75,31 @@ Future<void> savePackageIndex(String package, List<PackageIndexEntry> index) asy
 
 // ---
 
+final packagePropertiesCache = <String, PackageProperties>{};
+
+Future<PackageProperties?> loadPackageProperties(String package) async {
+  if (packagePropertiesCache[package] case var properties?) {
+    return properties;
+  }
+
+  final packagePropertiesFile = File(join(repoDir, package, 'properties.json'));
+  if (!await packagePropertiesFile.exists()) {
+    return null;
+  }
+
+  return fromJson(PackageProperties.endec, jsonDecode(await packagePropertiesFile.readAsString()));
+}
+
+Future<void> savePackageProperties(String package, PackageProperties properties) async {
+  final packagePropertiesFile = File(join(repoDir, package, 'properties.json'));
+  await packagePropertiesFile.create(recursive: true);
+  await packagePropertiesFile.writeAsString(jsonEncoder.convert(toJson(PackageProperties.endec, properties)));
+
+  packagePropertiesCache[package] = properties;
+}
+
+// ---
+
 Future<void> main(List<String> args) async {
   final logger = Logger('barmaid');
   Logger.root.level = Level.INFO;
@@ -207,10 +232,16 @@ Future<void> main(List<String> args) async {
           'pubspec': indexEntry.pubspec
         };
 
+    final properties = await loadPackageProperties(packageName);
+    final discontinued = properties?.discontinued ?? false;
+    final replacedBy = properties?.replacedBy;
+
     return Response.ok(
       headers: pubContentType,
       jsonEncode({
         'name': packageName,
+        'discontinued': discontinued,
+        if (replacedBy != null) 'replacedBy': replacedBy,
         'latest': {
           'version': encodeVersion(packageIndex.last),
         },
@@ -240,6 +271,23 @@ Future<void> main(List<String> args) async {
       );
     },
   );
+
+  app.post('/api/packages/<package-name>/properties', (Request request, String packageName) async {
+    if (tokens.checkAuth(request, packageName) case var response?) {
+      logger.warning('${request.origin} failed package permission check');
+      return response;
+    }
+
+    final packageIndex = await loadPackageIndex(packageName);
+    if (packageIndex == null) {
+      return errorResponse('unknown_package', 'unknown package', statusCode: HttpStatus.notFound);
+    }
+
+    final newProperties = fromJson(PackageProperties.endec, jsonDecode(await request.readAsString()));
+    savePackageProperties(packageName, newProperties);
+
+    return Response.ok(headers: pubContentType, '{}');
+  });
 
   final pipeline = const Pipeline().addMiddleware(
     createMiddleware(requestHandler: (request) {

@@ -14,6 +14,15 @@ final _$PackageIndexEntryEndec = structEndec<PackageIndexEntry>().with3Fields(
   (uuid, hash, pubspec) => PackageIndexEntry(uuid, hash, pubspec),
 );
 
+// static final Endec<PackageProperties> endec = _$PackagePropertiesEndec;
+final _$PackagePropertiesEndec = structEndec<PackageProperties>().with2Fields(
+  Endec.bool.fieldOf('discontinued', (struct) => struct.discontinued),
+  Endec.string
+      .optionalOf()
+      .fieldOf('replaced_by', (struct) => struct.replacedBy),
+  (discontinued, replacedBy) => PackageProperties(discontinued, replacedBy),
+);
+
 // static final Endec<TokenProperties> endec = _$TokenPropertiesEndec;
 final _$TokenPropertiesEndec = structEndec<TokenProperties>().with2Fields(
   Endec.string.fieldOf('owner', (struct) => struct.owner),
